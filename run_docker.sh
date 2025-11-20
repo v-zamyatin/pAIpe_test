@@ -1,0 +1,1 @@
+docker run --gpus all -it -v /mnt/jack-5/CardioGenetics_ILB/Gogol/pAIpe:/workspace cardiopaipe
