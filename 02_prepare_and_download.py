@@ -32,6 +32,223 @@ GPN_MSA_URL = "https://huggingface.co/datasets/songlab/gpn-msa-hg38-scores/resol
 GPN_MSA_INDEX_URL = "https://huggingface.co/datasets/songlab/gpn-msa-hg38-scores/resolve/main/scores.tsv.bgz.tbi"
 TG_URL = "https://huggingface.co/datasets/songlab/TraitGym/resolve/main/complex_traits_matched_9/test.parquet"
 
+#############################################
+#### CHECK INPUT FILE #######################
+#############################################
+import os
+import sys
+import pandas as pd
+
+INPUT_FILE = "/workspace/input_variants.txt"
+
+# Длины хромосом GRCh38/hg38 (primary assembly, NCBI/Ensembl) :contentReference[oaicite:2]{index=2}
+CHROM_SIZES = {
+    "chr1": 248_956_422,
+    "chr2": 242_193_529,
+    "chr3": 198_295_559,
+    "chr4": 190_214_555,
+    "chr5": 181_538_259,
+    "chr6": 170_805_979,
+    "chr7": 159_345_973,
+    "chr8": 145_138_636,
+    "chr9": 138_394_717,
+    "chr10": 133_797_422,
+    "chr11": 135_086_622,
+    "chr12": 133_275_309,
+    "chr13": 114_364_328,
+    "chr14": 107_043_718,
+    "chr15": 101_991_189,
+    "chr16": 90_338_345,
+    "chr17": 83_257_441,
+    "chr18": 80_373_285,
+    "chr19": 58_617_616,
+    "chr20": 64_444_167,
+    "chr21": 46_709_983,
+    "chr22": 50_818_468,
+    "chrX": 156_040_895,
+    "chrY": 57_227_415,
+    # митохондрия hg38, chrM (MT) ≈ 16 569 bp :contentReference[oaicite:3]{index=3}
+    "chrM": 16_569,
+}
+
+EXPECTED_HEADER = ["CHROM", "POS", "REF", "ALT"]
+VALID_BASES = {"A", "C", "G", "T"}
+
+
+def validate_input_variants(path: str) -> pd.DataFrame:
+    errors: list[str] = []
+
+    # --- 0. Базовые проверки файла ---
+    if not os.path.exists(path):
+        sys.exit(f"[ERROR] Input file not found: {path}")
+
+    if os.path.getsize(path) == 0:
+        sys.exit(f"[ERROR] Input file is empty: {path}")
+
+    # --- 1. Проверка хедера и разделителя ---
+    with open(path, "r", encoding="utf-8") as f:
+        header_line = f.readline().rstrip("\n\r")
+
+    header_cols_tab = header_line.split("\t")
+
+    if header_cols_tab != EXPECTED_HEADER:
+        errors.append(
+            "Header must be exactly (tab-separated): "
+            f"'CHROM\\tPOS\\tREF\\tALT', got: {header_line!r}"
+        )
+
+    # --- 2. Чтение таблицы как TSV (строки как строки) ---
+    try:
+        df = pd.read_csv(
+            path,
+            sep="\t",
+            dtype=str,
+            comment="#",
+        )
+    except Exception as e:
+        sys.exit(f"[ERROR] Failed to read TSV file '{path}': {e}")
+
+    # --- 3. Проверка количества и названий колонок ---
+    if df.shape[1] != 4:
+        errors.append(
+            f"File must contain exactly 4 columns, got {df.shape[1]}: {list(df.columns)!r}"
+        )
+
+    missing_cols = [c for c in EXPECTED_HEADER if c not in df.columns]
+    if missing_cols:
+        errors.append(f"Missing required columns: {missing_cols}")
+
+    extra_cols = [c for c in df.columns if c not in EXPECTED_HEADER]
+    if extra_cols:
+        errors.append(f"Unexpected extra columns present: {extra_cols}")
+
+    # Приводим к правильному порядку, если все колонки есть
+    if not missing_cols:
+        df = df[EXPECTED_HEADER]
+
+    # --- 4. Проверка пропусков ---
+    if df.isnull().any().any():
+        n_rows_with_na = df.isnull().any(axis=1).sum()
+        errors.append(f"Found {n_rows_with_na} rows with missing values (NaN / empty).")
+
+    # --- 5. Проверка названий хромосом ---
+    allowed_chroms = set(CHROM_SIZES.keys())
+    invalid_chr_mask = ~df["CHROM"].isin(allowed_chroms)
+    if invalid_chr_mask.any():
+        bad_chroms = sorted(df.loc[invalid_chr_mask, "CHROM"].dropna().unique())
+        errors.append(
+            "Invalid chromosome names detected: "
+            f"{', '.join(bad_chroms)}. "
+            f"Allowed: {', '.join(sorted(allowed_chroms))}."
+        )
+
+    # --- 6. Проверка POS: целые, >=1 и <= длины хромосомы ---
+    # сначала: все ли это целые числа
+    pos_str = df["POS"].astype(str)
+    non_int_mask = ~pos_str.str.fullmatch(r"[0-9]+")
+    if non_int_mask.any():
+        bad_examples = df.loc[non_int_mask, ["CHROM", "POS"]].head(5).to_dict(
+            orient="records"
+        )
+        errors.append(
+            f"POS column must contain positive integers only. "
+            f"Invalid POS in {non_int_mask.sum()} rows, examples: {bad_examples}"
+        )
+    else:
+        # конвертируем в int
+        df["POS"] = pos_str.astype(int)
+
+        # POS >= 1
+        below_one = df["POS"] < 1
+        if below_one.any():
+            errors.append(
+                f"{below_one.sum()} rows have POS < 1. "
+                "Positions are 1-based coordinates."
+            )
+
+        # POS <= длина хромосомы
+        for chrom, max_pos in CHROM_SIZES.items():
+            mask_chr = df["CHROM"] == chrom
+            if not mask_chr.any():
+                continue
+            over_mask = mask_chr & (df["POS"] > max_pos)
+            if over_mask.any():
+                max_seen = int(df.loc[over_mask, "POS"].max())
+                n_over = int(over_mask.sum())
+                examples = df.loc[over_mask, ["CHROM", "POS"]].head(5).to_dict(
+                    orient="records"
+                )
+                errors.append(
+                    f"{n_over} rows have POS > chromosome length for {chrom} "
+                    f"(max allowed {max_pos}, max seen {max_seen}). Examples: {examples}"
+                )
+
+    # --- 7. Проверка REF / ALT ---
+    for col in ["REF", "ALT"]:
+        # длина 1 символ
+        lengths = df[col].astype(str).str.len()
+        wrong_len_mask = lengths != 1
+        if wrong_len_mask.any():
+            examples = df.loc[wrong_len_mask, ["CHROM", "POS", col]].head(
+                5
+            ).to_dict(orient="records")
+            errors.append(
+                f"{wrong_len_mask.sum()} rows have {col} length != 1. "
+                f"Expected single nucleotide. Examples: {examples}"
+            )
+
+        # только A/C/G/T
+        upper_vals = df[col].astype(str).str.upper()
+        invalid_nt_mask = ~upper_vals.isin(VALID_BASES)
+        if invalid_nt_mask.any():
+            bad_vals = sorted(upper_vals[invalid_nt_mask].dropna().unique())
+            errors.append(
+                f"Invalid bases in column {col}: {', '.join(bad_vals)}. "
+                f"Allowed bases: {', '.join(sorted(VALID_BASES))}."
+            )
+
+    # REF != ALT
+    same_ra_mask = (
+        df["REF"].astype(str).str.upper() == df["ALT"].astype(str).str.upper()
+    )
+    if same_ra_mask.any():
+        examples = df.loc[same_ra_mask, ["CHROM", "POS", "REF", "ALT"]].head(
+            5
+        ).to_dict(orient="records")
+        errors.append(
+            f"{same_ra_mask.sum()} rows have REF == ALT (no variation). "
+            f"Examples: {examples}"
+        )
+
+    # --- 8. Дубликаты ---
+    dup_mask = df.duplicated(subset=["CHROM", "POS", "REF", "ALT"], keep=False)
+    if dup_mask.any():
+        examples = (
+            df.loc[dup_mask, ["CHROM", "POS", "REF", "ALT"]]
+            .drop_duplicates()
+            .head(5)
+            .to_dict(orient="records")
+        )
+        errors.append(
+            f"Found {dup_mask.sum()} duplicate rows with identical (CHROM, POS, REF, ALT). "
+            f"Examples: {examples}"
+        )
+
+    # --- 9. Итог ---
+    if errors:
+        print("[ERROR] Input variants file failed validation:\n", file=sys.stderr)
+        for i, msg in enumerate(errors, 1):
+            print(f"  {i}. {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"[OK] Input variants file '{path}' passed validation: "
+        f"{len(df)} variants, {df.shape[1]} columns."
+    )
+    return df
+
+
+validate_input_variants(INPUT_FILE)
 
 
 ################################################################################
